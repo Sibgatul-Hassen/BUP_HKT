@@ -63,6 +63,14 @@ async def _internal(_: Request, exc: Exception) -> JSONResponse:
 
 
 # ---- endpoints --------------------------------------------------------------
+@app.get("/")
+async def root() -> Dict[str, Any]:
+    return {
+        "service": "GridWise",
+        "endpoints": {"health": "GET /health", "optimize": "POST /optimize-energy", "docs": "GET /docs"},
+    }
+
+
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
