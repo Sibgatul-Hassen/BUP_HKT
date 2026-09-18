@@ -185,11 +185,18 @@ def _parse_readings(content: str, n_notes: int) -> List[Dict[str, Any]]:
         raise ValueError("empty model content")
     text = content.strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("no JSON object in model output")
-    data = json.loads(text[start: end + 1])
-    items = data.get("interpretations") if isinstance(data, dict) else None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # Prose around the JSON: take the outermost object or array.
+        spans = [(text.find(o), text.rfind(c)) for o, c in (("{", "}"), ("[", "]"))]
+        spans = [(s, e) for s, e in spans if 0 <= s < e]
+        if not spans:
+            raise ValueError("no JSON in model output") from None
+        s, e = min(spans)
+        data = json.loads(text[s: e + 1])
+    # Models sometimes drop the wrapper and return the bare list.
+    items = data if isinstance(data, list) else data.get("interpretations") if isinstance(data, dict) else None
     if not isinstance(items, list):
         raise ValueError("model output lacks an interpretations list")
 
