@@ -1,4 +1,4 @@
-# GridWise — LLM-Assisted Campus Energy Optimizer
+# BUPGridSchedular — LLM-Assisted Campus Energy Optimizer
 
 BUP CSE Fest 2026 · Hackathon · Online Preliminary
 
