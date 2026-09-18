@@ -140,8 +140,8 @@ class NoteInterpreter:
                 last_error = f"HTTP {e.response.status_code}"
                 if e.response.status_code == 400 and self._json_mode:
                     self._json_mode = False  # retry without response_format
-                elif e.response.status_code in (401, 403):
-                    break  # bad credentials: retrying will not help
+                elif e.response.status_code in (401, 402, 403):
+                    break  # bad credentials / no quota: retrying will not help
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
                 last_error = type(e).__name__
             log.warning("LLM attempt %d failed: %s", attempt + 1, last_error)
