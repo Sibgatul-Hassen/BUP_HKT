@@ -71,7 +71,9 @@ class NoteInterpreter:
         self.models = [self.model] + [
             m.strip() for m in os.environ.get("LLM_FALLBACK_MODELS", "").split(",") if m.strip()
         ]
-        self.max_attempts = max(2, min(len(self.models), 4))
+        self.max_attempts = 3
+        # Seconds to wait on a model call before firing a parallel duplicate.
+        self.hedge_after = _env_float("LLM_HEDGE_SECONDS", 3.0)
         self._cache: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
         self._cache_size = 512
         self._client: Optional[httpx.AsyncClient] = None
@@ -129,31 +131,70 @@ class NoteInterpreter:
             ensure_ascii=False,
         )
         deadline = time.monotonic() + self.total_budget
-        last_error = "no attempt made"
-        for attempt in range(self.max_attempts):
+        n = len(notes)
+        running: Dict["asyncio.Task[List[Dict[str, Any]]]", str] = {}
+        state = {"launched": 0, "rotation": 0, "last_error": "no attempt made"}
+
+        def launch(model: str) -> None:
             remaining = deadline - time.monotonic()
-            if remaining <= 0.5:
-                break
-            model = self.models[attempt % len(self.models)]
-            try:
-                content = await asyncio.wait_for(
-                    self._complete(user, model), timeout=min(self.attempt_timeout, remaining)
-                )
-                return _parse_readings(content, len(notes))
-            except asyncio.TimeoutError:
-                last_error = "timeout"
-            except httpx.HTTPStatusError as e:
-                last_error = f"HTTP {e.response.status_code}"
-                if e.response.status_code == 400 and self._json_mode:
-                    self._json_mode = False  # retry without response_format
-                elif e.response.status_code in (401, 402, 403):
-                    break  # bad credentials / no quota: retrying will not help
-                elif e.response.status_code == 429 and len(self.models) == 1:
-                    await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic() - 1)))
-            except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
-                last_error = type(e).__name__
-            log.warning("LLM attempt %d (%s) failed: %s", attempt + 1, model, last_error)
-        raise LLMUnavailable(last_error)
+            task = asyncio.ensure_future(
+                asyncio.wait_for(self._attempt(user, model, n), timeout=min(self.attempt_timeout, remaining))
+            )
+            running[task] = model
+            state["launched"] += 1
+
+        def next_model() -> str:
+            state["rotation"] += 1
+            return self.models[state["rotation"] % len(self.models)]
+
+        launch(self.models[0])
+        try:
+            while running:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                can_launch = state["launched"] < self.max_attempts and remaining > 1.0
+                # Hedge: if the in-flight call is slow, fire a duplicate and
+                # take whichever valid answer arrives first (cuts the latency tail).
+                wait_for = min(self.hedge_after, remaining) if can_launch and len(running) == 1 else remaining
+                done, _ = await asyncio.wait(running, timeout=wait_for, return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    if can_launch:
+                        # Hedge on a different model when one is configured: it
+                        # has its own rate-limit bucket, so hedging never doubles
+                        # the load on the primary's quota.
+                        hedge_model = next_model()
+                        log.info("LLM slow after %.1fs; hedging with %s", self.hedge_after, hedge_model)
+                        launch(hedge_model)
+                    continue
+                for task in done:
+                    model = running.pop(task)
+                    try:
+                        return task.result()
+                    except asyncio.TimeoutError:
+                        state["last_error"] = "timeout"
+                    except httpx.HTTPStatusError as e:
+                        code = e.response.status_code
+                        state["last_error"] = f"HTTP {code}"
+                        if code == 400 and self._json_mode:
+                            self._json_mode = False  # retry without response_format
+                        elif code in (401, 402, 403):
+                            raise LLMUnavailable(state["last_error"])  # retrying will not help
+                        elif code == 429 and len(self.models) == 1:
+                            await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic() - 1)))
+                    except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+                        state["last_error"] = type(e).__name__
+                    log.warning("LLM attempt (%s) failed: %s", model, state["last_error"])
+                # An error (not slowness): move on to the next model in rotation.
+                if not running and state["launched"] < self.max_attempts and deadline - time.monotonic() > 0.5:
+                    launch(next_model())
+        finally:
+            for task in running:
+                task.cancel()
+        raise LLMUnavailable(state["last_error"])
+
+    async def _attempt(self, user: str, model: str, n_notes: int) -> List[Dict[str, Any]]:
+        return _parse_readings(await self._complete(user, model), n_notes)
 
     async def _complete(self, user_content: str, model: str) -> str:
         body: Dict[str, Any] = {
