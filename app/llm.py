@@ -36,7 +36,7 @@ The schedule covers ONE day: hours 0..23 on a 24-hour clock. Each note maps to e
 - no_op: the note does not change today's 24-hour energy schedule: unrelated campus news, events on other days (tomorrow, next week, next month), or a condition that is not one of the types above.
 
 For every directive other than no_op, report:
-- windows: list of {"start_hour": S, "end_hour": E} on the 24-hour clock. S is the first affected hour. E is the hour the condition ENDS (exclusive): "from 1 PM to 3 PM" -> {"start_hour": 13, "end_hour": 15}. "until midnight"/"end of day" -> end_hour 24. noon = 12. A single hour such as "at 7 PM" or "during the 7 PM hour" -> {"start_hour": 19, "end_hour": 20}. "for 3 hours starting 4 PM" -> {"start_hour": 16, "end_hour": 19}. "all day" -> {"start_hour": 0, "end_hour": 24}. When AM/PM is omitted, choose the reading that makes sense (solar work is in daylight hours). Two separate periods -> two windows.
+- windows: list of {"start_hour": S, "end_hour": E} on the 24-hour clock. S is the first affected hour. E is the hour the condition ENDS (exclusive): "from 1 PM to 3 PM" -> {"start_hour": 13, "end_hour": 15}. "until midnight"/"end of day" -> end_hour 24. noon = 12. A single hour such as "at 7 PM" or "during the 7 PM hour" -> {"start_hour": 19, "end_hour": 20}. "for 3 hours starting 4 PM" -> {"start_hour": 16, "end_hour": 19}. "all day" -> {"start_hour": 0, "end_hour": 24}. A window crossing midnight keeps its real clock hours: "from 10 PM until 2 AM" -> {"start_hour": 22, "end_hour": 2}. When AM/PM is omitted, choose the reading that makes sense (solar work is in daylight hours). Two separate periods -> two windows.
 - quantity and quantity_kind, copying the number AS WRITTEN (do NOT convert it):
   * solar_reduction: "drops to 20%", "20% of forecast", "about 20% remains" -> quantity 20, kind "percent_remaining". "an 80% reduction", "cut by 80%", "80% lower" -> quantity 80, kind "percent_reduction". "half of normal output" -> 0.5 "fraction_remaining". "one-fifth of normal" -> 0.2 "fraction_remaining". "loses a quarter" -> 0.25 "fraction_reduction". "no solar at all"/"panels offline" -> 0 "fraction_remaining".
   * minimum_battery_reserve: "at least 120 kWh" -> 120 "kwh". "50% of battery capacity" -> 50 "percent_of_capacity". "half full" -> 0.5 "fraction_of_capacity".
@@ -66,7 +66,12 @@ class NoteInterpreter:
         self.api_key = os.environ.get("LLM_API_KEY", "")
         self.attempt_timeout = _env_float("LLM_TIMEOUT_SECONDS", 8.0)
         self.total_budget = _env_float("LLM_TOTAL_BUDGET_SECONDS", 20.0)
-        self.max_attempts = 2
+        # Optional comma-separated backups tried in turn when the primary is
+        # rate-limited, overloaded or slow (useful for shared free tiers).
+        self.models = [self.model] + [
+            m.strip() for m in os.environ.get("LLM_FALLBACK_MODELS", "").split(",") if m.strip()
+        ]
+        self.max_attempts = max(2, min(len(self.models), 4))
         self._cache: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
         self._cache_size = 512
         self._client: Optional[httpx.AsyncClient] = None
@@ -80,7 +85,7 @@ class NoteInterpreter:
     @property
     def provider_label(self) -> str:
         host = re.sub(r"^https?://", "", self.base_url).split("/")[0] if self.base_url else "none"
-        return f"{self.model or 'unset'} @ {host}"
+        return f"{', '.join(self.models) if self.model else 'unset'} @ {host}"
 
     async def close(self) -> None:
         if self._client is not None:
@@ -129,9 +134,10 @@ class NoteInterpreter:
             remaining = deadline - time.monotonic()
             if remaining <= 0.5:
                 break
+            model = self.models[attempt % len(self.models)]
             try:
                 content = await asyncio.wait_for(
-                    self._complete(user), timeout=min(self.attempt_timeout, remaining)
+                    self._complete(user, model), timeout=min(self.attempt_timeout, remaining)
                 )
                 return _parse_readings(content, len(notes))
             except asyncio.TimeoutError:
@@ -142,14 +148,16 @@ class NoteInterpreter:
                     self._json_mode = False  # retry without response_format
                 elif e.response.status_code in (401, 402, 403):
                     break  # bad credentials / no quota: retrying will not help
+                elif e.response.status_code == 429 and len(self.models) == 1:
+                    await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic() - 1)))
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
                 last_error = type(e).__name__
-            log.warning("LLM attempt %d failed: %s", attempt + 1, last_error)
+            log.warning("LLM attempt %d (%s) failed: %s", attempt + 1, model, last_error)
         raise LLMUnavailable(last_error)
 
-    async def _complete(self, user_content: str) -> str:
+    async def _complete(self, user_content: str, model: str) -> str:
         body: Dict[str, Any] = {
-            "model": self.model,
+            "model": model,
             "temperature": 0,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
